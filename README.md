@@ -35,7 +35,7 @@ The format is relatively simple: there is a top-level object, whose keys
 correspond to exporters (virtual packages). Each value is a list containing a
 base package, and then one-or-more import selectors.
 
-For instance, let's say you want `import bulk.math` to do the following:
+For instance, let's say you want `import bulk.math._` to do the following:
 
 ```scala
 import Predef.{any2stringadd => _, _}
