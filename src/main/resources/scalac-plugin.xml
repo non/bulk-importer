@@ -1,4 +1,4 @@
 <plugin>
   <name>bulk-importer</name>
-  <classname>d_m.BulkImporter</classname>
+  <classname>bulk.BulkImporter</classname>
 </plugin>

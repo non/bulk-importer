@@ -1,4 +1,4 @@
-package d_m
+package bulk
 
 import scala.tools.nsc
 import nsc.Global
@@ -14,114 +14,100 @@ import nsc.typechecker
 
 import scala.collection.mutable
 
-/**
- * Used to share state between the two phases. The state in question is a
- * mapping from "paths" (the fully-qualified names of objects annotated with
- * @Exports) to "imports" (a list of trees of imports).
- */
-class State() {
-  // ugly, but trying to figure out how to share trees between phases without
-  // angering the cake monster was too much work. sigh.
-  var exporters = mutable.Map.empty[String, List[Any]]
-}
-
 class BulkImporter(val global:Global) extends Plugin {
   val name = "bulk-importer"
   val description = "allows bulk import from @Exporter objects"
-
-  val state = new State()
-
-  val components = List(
-    new BulkImportDetector(this, state, global),
-    new BulkImportRewriter(this, state, global)
-  )
+  val components = List(new BulkImportRewriter(this, global))
 }
 
-/**
- * This particular phase search for objects annotated with @Exporter, makes
- * sure that the object in question only contains import statements, and then
- * stores the object's fully-qualified name and imports together in the
- * shared state.
- */
-class BulkImportDetector(plugin:Plugin, val state:State, val global:Global)
-extends PluginComponent with Transform with TypingTransformers with TreeDSL {
-
-  import global._
-
-  val runsAfter = "parser" :: Nil
-  val phaseName = "bulk-exporter"
-
-  // some names we're going to be using
-  val _Exporter = newTermName("Exporter")
-  val _init = newTermName("<init>")
-
-  def newTransformer(unit:CompilationUnit) = new MyTransformer(unit)
-
-  class MyTransformer(unit:CompilationUnit) extends TypingTransformer(unit) {
-
-    /**
-     * Given a list of trees (which should be annotations) this method will
-     * determine whether any of the annotations are @Exporter.
-     */
-    def isExporter(as:List[Tree]): Boolean = as match {
-      case Nil => false
-      case Apply(Select(New(_Exporter), _init), Nil) :: t => true
-      case _ :: t => isExporter(t)
-    }
-
-    /**
-     * This method search for @Exporter objects, returning a list of results.
-     * Each result is a tuple containing the "path" (the object's
-     * fully-qualified name) and "imports" (a list of trees of imports).
-     *
-     * The list of tuples will be added to our mutable state map.
-     */
-    def findExporters(t:Tree, names:List[String]):List[(String, List[Tree])] = t match {
-      case PackageDef(Ident(name), body) =>
-        body.flatMap(t => findExporters(t, name.toString :: names))
-
-      case ModuleDef(Modifiers(_, _, anns, _), name, Template(_, _, _ :: impl)) =>
-        if (isExporter(anns)) {
-          val path = (name.toString :: names).reverse.mkString(".")
-          impl.foreach {
-            case t:Import => {}
-            case t => sys.error("arggh: %s" format t)
-          }
-          List((path, impl))
-        } else {
-          Nil
-        }
-
-      case t =>
-        Nil
-    }
-
-    /**
-     * We basically want to search the top-level package to see if we have any
-     * @Exporter objects. Note that we don't currently make any attempt to
-     * consider objects in "exotic" places (e.g. inside other objects).
-     */
-    override def transform(tree: Tree): Tree = tree match {
-      case t:PackageDef =>
-        state.exporters ++= findExporters(t, Nil)
-        t
-      case t =>
-        t
-    }
-  }
-}
-
-/**
- * Using our mapping of @Exporter objects from the previous phase, this phase
- * will attempt to find wildcard imports from exporter objects, and replace
- * those with whatever imports the object contained.
- */
-class BulkImportRewriter(plugin:Plugin, val state:State, val global:Global)
+class BulkImportRewriter(plugin:Plugin, val global:Global)
 extends PluginComponent with Transform with TypingTransformers with TreeDSL {
   import global._
 
   val runsAfter = "parser" :: Nil
   val phaseName = "bulk-importer"
+
+  val exporters = mutable.Map.empty[String, List[Tree]]
+
+  loadJsonConfig()
+
+  def loadJsonConfig() {
+    import scala.util.parsing.json.JSON
+
+    val maybeJson = loadJsonString() flatMap (JSON.parseFull) collect {
+      case stmts:Map[_, _] => stmts.asInstanceOf[Map[String, Any]]
+    }
+
+    maybeJson match {
+      case Some(json) => parseJsonConfig(json)
+      case None => warning("bulk/exports.json could not be parsed")
+    }
+  }
+
+  def loadJsonString(): Option[String] = {
+    val cl = getClass.getClassLoader
+    val st = cl.getResourceAsStream("bulk/exports.json")
+    if (st == null) return None
+
+    try {
+      val br = new java.io.BufferedReader(new java.io.InputStreamReader(st))
+      val sb = new StringBuilder
+      var line = br.readLine()
+      while (line != null) {
+        sb.append(line)
+        line = br.readLine
+      }
+      Some(sb.toString)
+    } catch {
+      case e:Exception => None
+    }
+  }
+
+  def targetToImportSelector(t:Any) = t match {
+    case "_" =>
+      ImportSelector(nme.WILDCARD, -1, nme.WILDCARD, -1)
+
+    case (a:String) =>
+      val name = newTermName(a)
+      ImportSelector(name, -1, name, -1)
+
+    case (a:String) :: "_" :: Nil =>
+      ImportSelector(newTermName(a), -1, nme.WILDCARD, -1)
+
+    case (a:String) :: (b:String) :: Nil =>
+      ImportSelector(newTermName(a), -1, newTermName(b), -1)
+
+    case x =>
+      sys.error("couldn't handle %s" format x)
+  }
+
+  def targetsToImportSelectors(ts:List[Any]) = ts.map(targetToImportSelector)
+
+  def pkgToImport(pkg:String, selectors:List[ImportSelector]) = {
+    val p = pkg.split("\\.").toList match {
+      case h :: t => t.foldLeft(Ident(h):Tree)(Select(_, _))
+      case Nil => sys.error("invalid pkg: %s" format pkg)
+    }
+    Import(p, selectors)
+  }
+
+  def translateToTree(v:Any): List[Tree] = v match {
+    case (pkg:String) :: (targets:List[_]) :: Nil =>
+      pkgToImport(pkg, targetsToImportSelectors(targets)) :: Nil
+    case _ =>
+      Nil
+  }
+
+  def translateToTrees(v:Any): List[Tree] = v match {
+    case imports:List[_] => imports.asInstanceOf[List[Any]].flatMap(translateToTree)
+    case _ => Nil
+  }
+
+  def parseJsonConfig(stmts:Map[String, Any]) {
+    stmts.foreach {
+      case (k, v) => exporters("bulk." + k) = translateToTrees(v)
+    }
+  }
 
   def newTransformer(unit:CompilationUnit) = new MyTransformer(unit)
 
@@ -134,21 +120,21 @@ extends PluginComponent with Transform with TypingTransformers with TreeDSL {
     def parseImport(tree:Tree, names:List[String]): String = tree match {
       case Select(t, name) => parseImport(t, name.toString :: names)
       case Ident(name) => (name.toString :: names).mkString(".")
-      case t => sys.error("unexpected tree: %s" format t)
+      case t => { error("unexpected tree: %s" format t); null }
     }
 
     /**
      * Given a path (fully-qualified package), this method will either:
-     *  1. return a list of import trees (if the path was @Exported)
+     *  1. return a list of import trees (for paths in bulk/exports.json)
      *  2. return nothing (otherwise)
      */
     def getImports(path:String): Option[List[Tree]] = {
-      state.exporters.get(path).map(_.asInstanceOf[List[Tree]]) //ugh
+      exporters.get(path).map(_.asInstanceOf[List[Tree]]) //ugh
     }
 
     /**
      * This method attempts to recursively resolve imports to check for
-     * wildcard imports from @Exporter objects. It will return a list of trees
+     * wildcard imports from exporter objects. It will return a list of trees
      * to be injected into the parent tree (this is because one original
      * import tree will map to zero-or-more exported import trees).
      */
@@ -162,7 +148,7 @@ extends PluginComponent with Transform with TypingTransformers with TreeDSL {
 
     /**
      * Given a list of trees, return a new list of trees, replacing any
-     * wilcard imports from @Exporter objects with the desired import trees.
+     * wilcard imports from exporter objects with the desired import trees.
      */
     def resolve(ts:List[Tree]) = ts.flatMap(resolveBulkImports)
 

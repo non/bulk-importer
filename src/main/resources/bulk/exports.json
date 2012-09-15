@@ -1,0 +1,12 @@
+{
+  "foo": [
+    ["scala.collection", ["mutable", "immutable"]],
+    ["scala.math", ["pow", ["ceil", "ceiling"], "floor", "sqrt"]],
+    ["Predef", [["any2stringadd", "_"], "_"]]
+  ],
+  "bar": [
+    ["scala.annotation", ["tailrec"]],
+    ["scala.math.Numeric.Implicits", ["_"]],
+    ["scala", [["specialized", "spec"]]]
+  ]
+}
