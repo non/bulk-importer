@@ -11,40 +11,74 @@ which is translated at compile time into all the desired imports.
 
 ### Building the plugin
 
-Using SBT, you should just be able to run `package` to build the plugin. You
-can run the (meager) tests using `test`, but please be aware that repeated
-test runs will fail, so make sure to run `clean` between them. (For more
-information about these test failures, see the "Disclaimers" section.)
+To use this plugin, you'll need to build your own plugin jar with a customized
+list of exporter packages (virtual packages which provide zero or more imports
+each).
 
-### How to use it
+The first step is to edit `src/main/resources/bulk/exports.json`. This will be
+covered in more detail in the following section.
 
-First, you'll want to create a file for your bulk exports (e.g.
-`exports.scala`). Here's a set of exports I might want to use:
+Next, from SBT you should run `package` to build the plugin.
+
+Finally, you can run the tests using `test`. Note that the test compilation is
+the real indicator of success--if the test compiles, then things are working
+(presumably).
+
+### Configuring the plugin
+
+The bulk-importer plugin loads a configuration file from the plugin jar in
+order to determine how to behave. The file is located at
+`src/main/resources/bulk/exports.json` (and will be located at
+`bulk/exports.json` in the plugin jar).
+
+The format is relatively simple: there is a top-level object, whose keys
+correspond to exporters (virtual packages). Each value is a list containing a
+base package, and then one-or-more import selectors.
+
+For instance, let's say you want `import bulk.math` to do the following:
 
 ```scala
-package exports
+import Predef.{any2stringadd => _, _}
+import scala.collection.mutable
+import scala.math.{ceil, floor, round}
+import scala.annotation.tailrec
+```
 
-import d_m.Exporter
+You'd want to use the following JSON file:
 
-@Exporter object Bulk {
-    import Predef.{any2stringadd => _, _}
-    import scala.annotation.tailrec
-    import scala.{specialized => spec}
-    import scala.math._
+```javascript
+{
+  "math": [
+    ["Predef", [["any2stringadd", "_"], "_"]],
+    ["scala.collection", ["_"]],
+    ["scala.math", ["ceil", "floor", "round", "sqrt"]],
+    ["scala.annotation", ["tailrec"]]
+  ]
 }
 ```
 
-Once that's done, I can create a file (e.g. `demo.scala`) which uses the
-exports, a few I call "bulk importing". Here's an example:
+If you wanted to create multiple bulk imports, you would create multiple
+top-level keys, each of which would have its own internal structure. Note that
+`bulk` is the implied top-level package, so if you wanted to use
+`bulk.foo.bar` in your Scala code you'd want to use `foo.bar` in the JSON.
+
+The structure of the configuration file is relatively rigid--the above example
+demonstrates pretty much every available kind of selector.
+
+### Using the plugin
+
+After you've created your own compiler plugin jar, using it is relatively
+easy. Here's an example using the previous configuration:
 
 ```scala
 package demo
 
-// in this example, this import provides @tailrec, abs, and sqrt.
-import exports.Bulk._
+// note that this *must* be a wildcard import from bulk.math
+import bulk.math._
 
 object Demo {
-  @tailrec def gcd(a:Int, b:Int): Int = if (b == 0) abs(a) else gcd(b, a % b)
+  @tailrec def gcd(a:Int, b:Int): Int =
+    if (b == 0) abs(a) else gcd(b, a % b)
 
   def main(args:Array[String]) {
     println("the square root of 529 is %s" format sqrt(529))
@@ -52,48 +86,51 @@ object Demo {
 }
 ```
 
-The last crucial step is to compile using the compiler plugin, and to make
-sure to always compile `exports.scala` as well as `demo.scala`. If you fail to
-compile the exports file, your exports will not be found. Here's an example
-command line to use:
+The last crucial step is to compile using the compiler plugin. Here's an
+example command line to use:
 
 ```
-scalac -Xplugin:bulk-importer_2.9.2-0.1.jar demo.scala exports.scala
+scalac -Xplugin:path/to/bulk-importer_2.9.2-0.1.jar demo.scala
 ```
 
-You'll need to make sure the plugin can be found on your classpath.
+If you use SBT, you can edit your `build.sbt` file to include the compiler plugin:
+
+```
+scalacOptions += "-Xplugin:path/to/bulk-importer_2.9.2-0.1.jar"
+```
 
 ### How it works
 
-During compilation, any object annotated with `@Exporter` is scanned for
-imports, which are stored together with the object's path. In a later phase,
-imports are scanned to see if they match one of these exporter objects. If so,
-the "bulk imports" are substituted for the exporter object.
+When the compiler plugin's phase starts up, it requests the
+`bulk/exports.json` file from the classloader. It parses that file and
+determines which exporters  exist and what their effects should be.
 
-Observant readers will note that unless `exports.scala` is being scanned on the
-current compilation run the exporter objects won't be found. That is definitely
-a major limiation of the approach.
+Then during compilation, all imports are scanned, and any wildcard imports
+from an exporter are rewritten to use the bulk imports instead. Note that
+bulk-importer doesn't worry about whether the underlying imports are valid or
+not. If there are problems, scalac will catch them in a later phase.
+
+### Future work
+
+There are some `sys.error` cases in the plugin which should really be
+rewritten. Also, it would be nice to give specific warnings when we can detect
+that the user is doing something wrong (e.g. non-wildcard imports from
+exporters) or when the JSON file is malformed.
+
+It would be really nice if the configuration didn't have to be built into the
+plugin, but I couldn't easily think of a robust way for the user to supply
+this kind of information to the plugin. Ideas welcome!
 
 ### Disclaimers
 
-This is not guaranteed to work. In fact, it will definitely break if you use
-SBT, an IDE, or any build tool which will try to avoid unnecessary
-recompilation.
+This is not guaranteed to work. It's been tested a bit but it's still alpha
+quality code. If anyone is hoping to use this on their own codebase or at work
+I'd strongly suggest contributing some more tests, and/or reviewing the
+implementation.
 
-In the future, I'll try to use some other mechanism to encode the imports.
-Unfortunately, none of the options look that attractive. We could pickle the
-imports somehow, but that means that the plugin would need to somehow scan the
-entire classpath looking for these things. We could put them in some kind of
-external configuration file, but this is obviously pretty ugly, error-prone,
-and clunky. If you have ideas please let me know!
-
-It would be trivial to build a plugin with a hardcoded set of imports, so if
-anyone wanting a more robust version of this plugin for actual use should
-consider just building a hardcoded version (or asking for one nicely).
-
-Beyond the partial compilation issues, the machinery is somewhat fragile. I'm
-going to try to work on implementing better error messages and warnings but for
-now I would encourage you to use top-level objects that only contain imports.
+Obviously the *right* way to do a feature like this would be to modify scalac.
+This plugin is somewhat of a stopgap, as well as a way for users on 2.9.x and
+2.10.x to get this functionality right now.
 
 ### Copyright and License
 
